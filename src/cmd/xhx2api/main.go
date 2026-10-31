@@ -11,9 +11,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
+	"xhx2api/internal/auth"
 	"xhx2api/internal/checkin"
 	"xhx2api/internal/config"
 	"xhx2api/internal/logx"
@@ -43,7 +45,24 @@ func main() {
 		os.Exit(2)
 	}
 
+	authManager, credentials, err := auth.New(cfg.Admin.AuthFileValue(), cfg.Admin.SessionTTL())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动失败：初始化管理员认证失败：%v\n", err)
+		os.Exit(2)
+	}
+	initialCredentialsPath := ""
+	if credentials.Generated {
+		initialCredentialsPath, err = writeInitialCredentials(cfg.Admin.AuthFileValue(), credentials)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "启动失败：写入初始管理员凭据失败：%v\n", err)
+			os.Exit(2)
+		}
+	}
+
 	logger := newLogger(cfg)
+	if initialCredentialsPath != "" {
+		logger.Alwaysf("[main] 初始管理员凭据已写入：%s", initialCredentialsPath)
+	}
 
 	client := upstream.NewClient(upstream.Options{
 		LLMBase:               cfg.Upstream.LLMBaseURL(),
@@ -63,12 +82,16 @@ func main() {
 	})
 
 	accountPool := pool.New(pool.Config{
-		File:                 cfg.Accounts.AccountsFile(),
-		Strategy:             cfg.Accounts.StrategyValue(),
-		RefreshMarginSeconds: int(cfg.Accounts.RefreshMargin().Seconds()),
-		CooldownSeconds:      int(cfg.Accounts.Cooldown().Seconds()),
-		MaxAttempts:          cfg.Accounts.MaxAttemptsValue(),
-		RefreshOn401:         cfg.Accounts.RefreshOn401Value(),
+		File:                       cfg.Accounts.AccountsFile(),
+		Strategy:                   cfg.Accounts.StrategyValue(),
+		RefreshMarginSeconds:       int(cfg.Accounts.RefreshMargin().Seconds()),
+		CooldownSeconds:            int(cfg.Accounts.Cooldown().Seconds()),
+		MaxInflightPerAccount:      cfg.Accounts.MaxInflightPerAccountValue(),
+		ServerErrorCooldownSeconds: int(cfg.Accounts.ServerErrorCooldown().Seconds()),
+		FailureDecaySeconds:        int(cfg.Accounts.FailureDecay().Seconds()),
+		CooldownMaxSeconds:         int(cfg.Accounts.CooldownMax().Seconds()),
+		MaxAttempts:                cfg.Accounts.MaxAttemptsValue(),
+		RefreshOn401:               cfg.Accounts.RefreshOn401Value(),
 	}, client, logger)
 
 	catalog := server.NewCatalog(client, cfg.Models.CatalogCacheTTL(), cfg.Models.CatalogCacheFileValue())
@@ -87,11 +110,14 @@ func main() {
 		MaxAttemptsPerDay: cfg.Checkin.MaxAttemptsPerDayValue(),
 		HistoryFile:       cfg.Checkin.HistoryFileValue(),
 		HistoryDays:       cfg.Checkin.HistoryDaysValue(),
+		Concurrency:       cfg.Checkin.ConcurrencyValue(),
+		Jitter:            cfg.Checkin.Jitter(),
 	}, client, accountPool, logger)
 
 	printStartup(cfg, accountPool, catalog, logger)
 
 	app := server.New(cfg, client, accountPool, catalog, logger, version.Version)
+	app.SetAuth(authManager, cfg.Admin.CookieSecure())
 	app.SetCheckin(checkinSvc)
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr(),
@@ -128,6 +154,37 @@ func main() {
 		logger.Warnf("[main] 优雅退出失败：%v", err)
 	}
 	logger.Infof("[main] 已退出")
+}
+
+// writeInitialCredentials 把首次创建的管理员凭据写到认证文件同目录，权限固定为 0600。
+// 返回值是绝对路径；凭据内容只落文件，不进入日志。
+func writeInitialCredentials(authFile string, credentials auth.Credentials) (string, error) {
+	path, err := filepath.Abs(filepath.Join(filepath.Dir(authFile), "initial-credentials.txt"))
+	if err != nil {
+		return "", fmt.Errorf("解析初始凭据文件路径失败: %w", err)
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return "", fmt.Errorf("创建初始凭据文件失败: %w", err)
+	}
+	defer func() { _ = file.Close() }()
+	if err := file.Chmod(0o600); err != nil {
+		return "", fmt.Errorf("设置初始凭据文件权限失败: %w", err)
+	}
+	content := fmt.Sprintf(
+		"xhx2api 初始管理员凭据\n\n用户名: %s\n密码: %s\nAPI Key: %s\n\n请登录后尽快删除本文件。\n",
+		credentials.Username, credentials.Password, credentials.APIKey,
+	)
+	if _, err := io.WriteString(file, content); err != nil {
+		return "", fmt.Errorf("写入初始凭据文件失败: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		return "", fmt.Errorf("同步初始凭据文件失败: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return "", fmt.Errorf("关闭初始凭据文件失败: %w", err)
+	}
+	return path, nil
 }
 
 // runHealthcheck 对 URL 发一次 GET：2xx → nil，否则返回错误。

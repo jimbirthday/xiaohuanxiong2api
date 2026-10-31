@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // writeTemp 写一个临时配置文件并返回路径。
@@ -283,11 +284,60 @@ func TestLoginDefaults(t *testing.T) {
 	}
 }
 
+// TestAccountSchedulingDefaults 覆盖新增账号池调度字段的默认值与访问器。
+func TestAccountSchedulingDefaults(t *testing.T) {
+	clearEnv(t)
+	cfg, err := Load(writeTemp(t, `{}`))
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if *cfg.Accounts.MaxInflightPerAccount != DefaultMaxInflightPerAccount {
+		t.Fatalf("max_inflight_per_account 默认值 = %d", *cfg.Accounts.MaxInflightPerAccount)
+	}
+	if *cfg.Accounts.ServerErrorCooldownSeconds != DefaultServerErrorCooldownSeconds {
+		t.Fatalf("server_error_cooldown_seconds 默认值 = %d", *cfg.Accounts.ServerErrorCooldownSeconds)
+	}
+	if *cfg.Accounts.FailureDecaySeconds != DefaultFailureDecaySeconds {
+		t.Fatalf("failure_decay_seconds 默认值 = %d", *cfg.Accounts.FailureDecaySeconds)
+	}
+	if *cfg.Accounts.CooldownMaxSeconds != DefaultCooldownMaxSeconds {
+		t.Fatalf("cooldown_max_seconds 默认值 = %d", *cfg.Accounts.CooldownMaxSeconds)
+	}
+	if cfg.Accounts.MaxInflightPerAccountValue() != DefaultMaxInflightPerAccount ||
+		cfg.Accounts.ServerErrorCooldown().Seconds() != float64(DefaultServerErrorCooldownSeconds) ||
+		cfg.Accounts.FailureDecay().Seconds() != float64(DefaultFailureDecaySeconds) ||
+		cfg.Accounts.CooldownMax().Seconds() != float64(DefaultCooldownMaxSeconds) {
+		t.Fatalf("账号调度访问器与默认值不一致: %+v", cfg.Accounts)
+	}
+}
+
 // TestBadLoginTTL 覆盖「login.state_ttl_seconds 不能为负」。
 func TestBadLoginTTL(t *testing.T) {
 	clearEnv(t)
 	_, err := Load(writeTemp(t, `{"login": {"state_ttl_seconds": -1}}`))
 	if err == nil || !strings.Contains(err.Error(), "login.state_ttl_seconds") {
 		t.Fatalf("期望 state_ttl_seconds 校验失败，实际: %v", err)
+	}
+}
+
+// TestCheckinSchedulingDefaults 覆盖签到并发与确定性抖动配置。
+func TestCheckinSchedulingDefaults(t *testing.T) {
+	clearEnv(t)
+	cfg, err := Load(writeTemp(t, `{}`))
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if cfg.Checkin.ConcurrencyValue() != DefaultCheckinConcurrency {
+		t.Fatalf("checkin.concurrency 默认值 = %d", cfg.Checkin.ConcurrencyValue())
+	}
+	if cfg.Checkin.Jitter() != time.Duration(DefaultCheckinJitterSeconds)*time.Second {
+		t.Fatalf("checkin.jitter_seconds 默认值 = %s", cfg.Checkin.Jitter())
+	}
+
+	if _, err := Load(writeTemp(t, `{"checkin":{"concurrency":0}}`)); err == nil || !strings.Contains(err.Error(), "checkin.concurrency") {
+		t.Fatalf("concurrency=0 应校验失败，实际: %v", err)
+	}
+	if _, err := Load(writeTemp(t, `{"checkin":{"jitter_seconds":-1}}`)); err == nil || !strings.Contains(err.Error(), "checkin.jitter_seconds") {
+		t.Fatalf("jitter_seconds=-1 应校验失败，实际: %v", err)
 	}
 }

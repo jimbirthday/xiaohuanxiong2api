@@ -317,7 +317,7 @@ func TestAdminPatchAccessToken(t *testing.T) {
 	}
 }
 
-// TestAdminWriteQueryKeyAuth 覆盖「?key= 鉴权对写操作同样有效」。
+// TestAdminWriteQueryKeyAuth 覆盖「?key= 仅用于 GET，不能授权写操作」。
 func TestAdminWriteQueryKeyAuth(t *testing.T) {
 	handler := func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }
 	const key = "k-query"
@@ -325,8 +325,13 @@ func TestAdminWriteQueryKeyAuth(t *testing.T) {
 		"id": "a1", "access_token": "tok", "enabled": true, "priority": 1,
 	}}, func(cfg *config.Config) { cfg.Admin.APIKey = sp(key) })
 
-	resp, data := env.writeReq(t, http.MethodPatch, "/admin/api/accounts/a1?key="+key, `{"enabled":false}`, "")
+	resp, data := env.writeReq(t, http.MethodGet, "/admin/api/accounts?key="+key, "", "")
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("?key= 写操作状态码 = %d, 期望 200, body=%s", resp.StatusCode, data)
+		t.Fatalf("?key= GET 状态码 = %d, 期望 200, body=%s", resp.StatusCode, data)
+	}
+
+	resp, data = env.writeReq(t, http.MethodPatch, "/admin/api/accounts/a1?key="+key, `{"enabled":false}`, "")
+	if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("?key= 写操作状态码 = %d, 期望 401 或 403, body=%s", resp.StatusCode, data)
 	}
 }

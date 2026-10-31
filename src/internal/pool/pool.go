@@ -1,8 +1,8 @@
 // Package pool 实现 §5 的账号池：加载/回写账号文件、选号、单飞刷新、冷却。
 //
 // 硬约束：持锁期间不做网络 IO、不写盘、不打日志（SPEC §2.6）。
-// 因此网络刷新与文件回写都在锁外完成；状态变更用主 mutex 保护，文件写入用
-// 独立的 persistMu 串行化。
+// 因此网络刷新与文件回写都在 mu 外完成；状态变更用主 mutex 保护，所有会落盘
+// 的写路径用 writeMu 串行化。Acquire/Release 只短暂持有 mu，不等待写盘。
 package pool
 
 import (
@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -31,17 +32,26 @@ var (
 //
 // 未知字段通过 extra 原样保留，回写时不丢（SPEC §5.1）。
 type Account struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	UserID        string `json:"user_id"`
-	AccessToken   string `json:"access_token"`
-	RefreshToken  string `json:"refresh_token"`
-	ExpiresAt     int64  `json:"expires_at"`
-	Enabled       bool   `json:"enabled"`
-	Priority      int    `json:"priority"`
-	LastRefreshAt int64  `json:"last_refresh_at"`
-	CooldownUntil int64  `json:"cooldown_until"`
-	LastError     string `json:"last_error"`
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	UserID           string `json:"user_id"`
+	AccessToken      string `json:"access_token"`
+	RefreshToken     string `json:"refresh_token"`
+	ExpiresAt        int64  `json:"expires_at"`
+	Enabled          bool   `json:"enabled"`
+	Priority         int    `json:"priority"`
+	Weight           int    `json:"weight"`
+	LastUsedAt       int64  `json:"last_used_at"`
+	ConsecutiveFails int    `json:"consecutive_fails"`
+	LastFailureAt    int64  `json:"last_failure_at"`
+	LastRefreshAt    int64  `json:"last_refresh_at"`
+	CooldownUntil    int64  `json:"cooldown_until"`
+	LastError        string `json:"last_error"`
+
+	// 在途请求只存在内存，不随账号文件持久化。
+	inFlight int
+	// leaseID 标识一次 Acquire；只存在本次返回的快照中，用于幂等 Release。
+	leaseID uint64
 
 	extra map[string]json.RawMessage
 }
@@ -60,6 +70,9 @@ func (a *Account) UnmarshalJSON(data []byte) error {
 	*a = Account(tmp)
 	if _, ok := raw["enabled"]; !ok {
 		a.Enabled = true // 缺省启用
+	}
+	if a.Weight <= 0 {
+		a.Weight = 100 // weight 缺省或非法时按默认权重参与调度
 	}
 	a.extra = raw
 	return nil
@@ -111,26 +124,34 @@ func (a *Account) SetExtra(key string, value json.RawMessage) {
 
 // Config 是账号池配置（由 §3 accounts 换算）。
 type Config struct {
-	File                 string
-	Strategy             string
-	RefreshMarginSeconds int
-	CooldownSeconds      int
-	MaxAttempts          int
-	RefreshOn401         bool
+	File                       string
+	Strategy                   string
+	RefreshMarginSeconds       int
+	CooldownSeconds            int
+	MaxInflightPerAccount      int
+	ServerErrorCooldownSeconds int
+	FailureDecaySeconds        int
+	CooldownMaxSeconds         int
+	MaxAttempts                int
+	RefreshOn401               bool
 }
 
 // Pool 是进程内共享的账号池。
 type Pool struct {
-	mu        sync.Mutex
-	persistMu sync.Mutex
+	mu sync.Mutex
+	// writeMu 串行化持久化写事务：修改内存、生成待写快照和原子落盘必须整体
+	// 与其他持久化写互斥，避免导入写盘期间其他写路径插队导致内存/磁盘分叉。
+	writeMu sync.Mutex
 
 	cfg    Config
 	client *upstream.Client
 	logger *logx.Logger
 
-	accounts []*Account
-	rr       uint64
-	inflight map[string]*refreshFlight
+	accounts  []*Account
+	rrWeight  map[string]int64
+	inflight  map[string]*refreshFlight
+	nextLease uint64
+	leases    map[uint64]string
 }
 
 type refreshFlight struct {
@@ -147,7 +168,9 @@ func New(cfg Config, client *upstream.Client, logger *logx.Logger) *Pool {
 		cfg:      cfg,
 		client:   client,
 		logger:   logger,
+		rrWeight: map[string]int64{},
 		inflight: map[string]*refreshFlight{},
+		leases:   map[uint64]string{},
 	}
 	p.load()
 	return p
@@ -171,22 +194,29 @@ func (p *Pool) load() {
 		return
 	}
 	p.accounts = file.Accounts
+	for _, account := range p.accounts {
+		if account.Weight <= 0 {
+			account.Weight = 100
+		}
+	}
 }
 
-// persist 把账号池原子写回文件（临时文件 + rename，权限 0600）。
-//
-// 快照在 mu 内完成（只做序列化，无 IO），文件写入在锁外完成；
-// 返回错误供写接口判断（SPEC4 §G.2），现有调用点可忽略返回值。
-func (p *Pool) persist() error {
-	p.persistMu.Lock()
-	defer p.persistMu.Unlock()
-
+// persistLocked 把当前账号池原子写回文件；调用方必须持有 writeMu。
+// 快照只在 mu 内复制，序列化与文件 IO 均在 mu 外完成。
+func (p *Pool) persistLocked() error {
 	p.mu.Lock()
+	accounts := cloneAccountListLocked(p.accounts)
+	p.mu.Unlock()
+	return p.writeAccountsLocked(accounts)
+}
+
+// writeAccountsLocked 将给定快照原子写回文件（临时文件 + rename，权限 0600）。
+// 调用方必须持有 writeMu；本函数不访问 p.accounts，也不持有 mu。
+func (p *Pool) writeAccountsLocked(accounts []*Account) error {
 	payload := struct {
 		Accounts []*Account `json:"accounts"`
-	}{Accounts: p.accounts}
+	}{Accounts: accounts}
 	data, err := json.MarshalIndent(payload, "", "  ")
-	p.mu.Unlock()
 	if err != nil {
 		p.logger.Warnf("[pool] 警告：序列化账号文件失败：%v", err)
 		return fmt.Errorf("序列化账号文件失败：%v", err)
@@ -245,43 +275,278 @@ func (p *Pool) expiring(expiresAt int64, now int64) bool {
 	return now+margin >= expiresAt
 }
 
-// Pick 选一个可用账号（返回副本，不在锁外暴露内部指针）。
+func effectiveWeight(account *Account) int64 {
+	if account.Weight <= 0 {
+		return 100 // 账号文件缺省 weight 时保持旧行为：等权
+	}
+	return int64(account.Weight)
+}
+
+// failureTierLocked 把仍处于失败衰减窗口内的账号降层；成功或衰减后回到健康层。
+func (p *Pool) failureTierLocked(account *Account, now int64) int {
+	if account.ConsecutiveFails <= 0 {
+		return 0
+	}
+	decay := int64(p.cfg.FailureDecaySeconds) * 1000
+	if decay <= 0 || account.LastFailureAt <= 0 || now-account.LastFailureAt >= decay {
+		return 0
+	}
+	return 1
+}
+
+func (p *Pool) eligibleLocked(account *Account, exclude map[string]bool, now int64) bool {
+	if !account.Enabled || account.AccessToken == "" || account.CooldownUntil > now {
+		return false
+	}
+	if exclude != nil && exclude[account.ID] {
+		return false
+	}
+	if p.cfg.MaxInflightPerAccount > 0 && account.inFlight >= p.cfg.MaxInflightPerAccount {
+		return false
+	}
+	return true
+}
+
+// pickRoundRobinLocked 用平滑加权轮转分配请求，并以 LRU 作为同权重候选的平局依据。
 //
-// 跳过 enabled=false、冷却中、无 access_token 的账号；exclude 里的 id 也跳过。
-// priority 策略按 priority 升序（相同按文件顺序）；round_robin 在可用集合上轮转。
+// 只对失败层级最低的候选调用，避免连续失败账号抢占健康账号。
+func (p *Pool) pickRoundRobinLocked(candidates []*Account) *Account {
+	if p.rrWeight == nil {
+		p.rrWeight = map[string]int64{}
+	}
+	var total int64
+	for _, account := range candidates {
+		total += effectiveWeight(account)
+	}
+	if total <= 0 {
+		return candidates[0]
+	}
+
+	var chosen *Account
+	var chosenCurrent int64
+	for _, account := range candidates {
+		current := p.rrWeight[account.ID] + effectiveWeight(account)
+		p.rrWeight[account.ID] = current
+		if chosen == nil || current > chosenCurrent ||
+			(current == chosenCurrent && account.LastUsedAt < chosen.LastUsedAt) {
+			chosen = account
+			chosenCurrent = current
+		}
+	}
+	p.rrWeight[chosen.ID] -= total
+	return chosen
+}
+
+// pickLocked 在锁内完成过滤、分层、排序与 last_used 更新；acquire 时同时占用在途名额。
+func (p *Pool) pickLocked(exclude map[string]bool, acquire bool) *Account {
+	now := time.Now().UnixMilli()
+	candidates := make([]*Account, 0, len(p.accounts))
+	bestTier := 1
+	for _, account := range p.accounts {
+		if !p.eligibleLocked(account, exclude, now) {
+			continue
+		}
+		tier := p.failureTierLocked(account, now)
+		if tier < bestTier {
+			bestTier = tier
+		}
+		candidates = append(candidates, account)
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	// 健康账号始终优先；只有健康层不可用时才进入失败衰减层。
+	filtered := candidates[:0]
+	for _, account := range candidates {
+		if p.failureTierLocked(account, now) == bestTier {
+			filtered = append(filtered, account)
+		}
+	}
+	candidates = filtered
+
+	var chosen *Account
+	if p.cfg.Strategy == "round_robin" {
+		chosen = p.pickRoundRobinLocked(candidates)
+	} else {
+		sort.SliceStable(candidates, func(i, j int) bool {
+			left, right := candidates[i], candidates[j]
+			if left.Priority != right.Priority {
+				return left.Priority < right.Priority
+			}
+			if left.LastUsedAt != right.LastUsedAt {
+				return left.LastUsedAt < right.LastUsedAt
+			}
+			return effectiveWeight(left) > effectiveWeight(right)
+		})
+		chosen = candidates[0]
+	}
+	chosen.LastUsedAt = now
+	result := chosen.clone()
+	if acquire {
+		chosen.inFlight++
+		p.nextLease++
+		result.leaseID = p.nextLease
+		p.leases[p.nextLease] = chosen.ID
+	}
+	return result
+}
+
+// Pick 选一个可用账号但不占用在途名额，保留给只读选号或兼容调用。
 func (p *Pool) Pick(exclude map[string]bool) *Account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.pickLocked(exclude, false)
+}
+
+// Acquire 原子地选号并增加账号在途计数；调用方必须保证每条路径恰好 Release 一次。
+func (p *Pool) Acquire(exclude map[string]bool) *Account {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.pickLocked(exclude, true)
+}
+
+// Release 归还一次 Acquire 租约。重复调用同一租约是 no-op，不会误减其他在途请求。
+func (p *Pool) Release(acquired *Account) {
+	if acquired == nil || acquired.leaseID == 0 {
+		return
+	}
+	p.mu.Lock()
+	id, ok := p.leases[acquired.leaseID]
+	if !ok {
+		p.mu.Unlock()
+		return
+	}
+	delete(p.leases, acquired.leaseID)
+	account := p.findLocked(id)
+	if account != nil && account.inFlight > 0 {
+		account.inFlight--
+	}
+	p.mu.Unlock()
+}
+
+// RecordSuccess 清除连续失败与最近失败时间，使账号回到健康层。
+func (p *Pool) RecordSuccess(id string) {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+
+	p.mu.Lock()
+	account := p.findLocked(id)
+	if account == nil {
+		p.mu.Unlock()
+		return
+	}
+	account.ConsecutiveFails = 0
+	account.LastFailureAt = 0
+	account.LastError = ""
+	p.mu.Unlock()
+	_ = p.persistLocked()
+}
+
+func (p *Pool) failureCooldown(consecutiveFails int) time.Duration {
+	base := time.Duration(p.cfg.ServerErrorCooldownSeconds) * time.Second
+	if base <= 0 {
+		return 0
+	}
+	cooldown := base
+	for i := 1; i < consecutiveFails && i < 32; i++ {
+		if cooldown > time.Duration(1<<62) {
+			break
+		}
+		cooldown *= 2
+		limit := time.Duration(p.cfg.CooldownMaxSeconds) * time.Second
+		if limit > 0 && cooldown >= limit {
+			return limit
+		}
+	}
+	limit := time.Duration(p.cfg.CooldownMaxSeconds) * time.Second
+	if limit > 0 && cooldown > limit {
+		return limit
+	}
+	return cooldown
+}
+
+// RecordFailure 累计连续失败并按指数退避写入冷却，返回本次冷却时长。
+func (p *Pool) RecordFailure(id string) time.Duration {
 	now := time.Now().UnixMilli()
-	available := make([]*Account, 0, len(p.accounts))
-	for _, account := range p.accounts {
-		if !account.Enabled || account.AccessToken == "" {
-			continue
-		}
-		if account.CooldownUntil > now {
-			continue
-		}
-		if exclude != nil && exclude[account.ID] {
-			continue
-		}
-		available = append(available, account)
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+
+	p.mu.Lock()
+	account := p.findLocked(id)
+	if account == nil {
+		p.mu.Unlock()
+		return 0
 	}
-	if len(available) == 0 {
-		return nil
-	}
-	var chosen *Account
-	if p.cfg.Strategy == "round_robin" {
-		chosen = available[int(p.rr%uint64(len(available)))]
-		p.rr++
+	decay := int64(p.cfg.FailureDecaySeconds) * 1000
+	if account.ConsecutiveFails <= 0 || account.LastFailureAt <= 0 || decay <= 0 || now-account.LastFailureAt >= decay {
+		account.ConsecutiveFails = 1
 	} else {
-		chosen = available[0]
-		for _, account := range available[1:] {
-			if account.Priority < chosen.Priority {
-				chosen = account
-			}
+		account.ConsecutiveFails++
+	}
+	account.LastFailureAt = now
+	cooldown := p.failureCooldown(account.ConsecutiveFails)
+	if cooldown > 0 {
+		until := now + cooldown.Milliseconds()
+		if until > account.CooldownUntil {
+			account.CooldownUntil = until
 		}
 	}
-	return chosen.clone()
+	account.LastError = "上游连续失败 " + fmt.Sprint(account.ConsecutiveFails) + " 次"
+	p.mu.Unlock()
+	_ = p.persistLocked()
+	return cooldown
+}
+
+// CooldownFor 以指定时长冷却账号，并受 cooldown_max_seconds 封顶。
+func (p *Pool) CooldownFor(id string, duration time.Duration) {
+	if duration < 0 {
+		duration = 0
+	}
+	if limit := time.Duration(p.cfg.CooldownMaxSeconds) * time.Second; limit > 0 && duration > limit {
+		duration = limit
+	}
+	now := time.Now().UnixMilli()
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+
+	p.mu.Lock()
+	account := p.findLocked(id)
+	if account == nil {
+		p.mu.Unlock()
+		return
+	}
+	until := now + duration.Milliseconds()
+	if until > account.CooldownUntil {
+		account.CooldownUntil = until
+	}
+	account.LastError = "上游返回 429，账号已冷却"
+	p.mu.Unlock()
+	_ = p.persistLocked()
+}
+
+// MinCooldownRemaining 返回给定账号中最小的正剩余冷却时长；均未冷却时返回 0。
+func (p *Pool) MinCooldownRemaining(ids []string) time.Duration {
+	now := time.Now().UnixMilli()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var minimum time.Duration
+	found := false
+	for _, id := range ids {
+		account := p.findLocked(id)
+		if account == nil {
+			continue
+		}
+		remaining := time.Duration(account.CooldownUntil-now) * time.Millisecond
+		if remaining <= 0 {
+			continue
+		}
+		if !found || remaining < minimum {
+			minimum = remaining
+			found = true
+		}
+	}
+	return minimum
 }
 
 // Token 返回指定账号当前可用的 access_token。
@@ -320,6 +585,11 @@ func (p *Pool) Token(ctx context.Context, id string, force bool) (string, error)
 
 	access, newRefresh, err := p.client.Refresh(ctx, refreshToken)
 
+	// 网络刷新完成后才进入写事务；写锁覆盖状态更新与落盘，导入写盘期间
+	// 不会插入一次只改内存但尚未持久化的 token 更新。
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+
 	p.mu.Lock()
 	if err == nil {
 		if account := p.findLocked(id); account != nil {
@@ -344,7 +614,7 @@ func (p *Pool) Token(ctx context.Context, id string, force bool) (string, error)
 	close(flight.done)
 	p.mu.Unlock()
 
-	p.persist()
+	_ = p.persistLocked()
 	if err != nil {
 		return "", err
 	}
@@ -353,23 +623,20 @@ func (p *Pool) Token(ctx context.Context, id string, force bool) (string, error)
 
 // Cooldown 把账号冷却 cooldown_seconds。
 func (p *Pool) Cooldown(id string) {
-	p.mu.Lock()
-	if account := p.findLocked(id); account != nil {
-		account.CooldownUntil = time.Now().UnixMilli() + int64(p.cfg.CooldownSeconds)*1000
-		account.LastError = "上游返回 429，账号已冷却"
-	}
-	p.mu.Unlock()
-	p.persist()
+	p.CooldownFor(id, time.Duration(p.cfg.CooldownSeconds)*time.Second)
 }
 
 // MarkError 记录账号最近一次错误（不冷却）。
 func (p *Pool) MarkError(id, message string) {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+
 	p.mu.Lock()
 	if account := p.findLocked(id); account != nil {
 		account.LastError = message
 	}
 	p.mu.Unlock()
-	p.persist()
+	_ = p.persistLocked()
 }
 
 // FirstToken 返回首个启用账号的 access_token（用于目录刷新等只读动作）；没有则空串。
@@ -413,6 +680,10 @@ type AccountView struct {
 	UserID           string `json:"user_id"`
 	Enabled          bool   `json:"enabled"`
 	Priority         int    `json:"priority"`
+	Weight           int    `json:"weight"`
+	LastUsedAt       int64  `json:"last_used_at"`
+	ConsecutiveFails int    `json:"consecutive_fails"`
+	InFlight         int    `json:"inflight"`
 	TokenTail        string `json:"token_tail"`
 	ExpiresAt        int64  `json:"expires_at"`
 	ExpiresInSeconds int64  `json:"expires_in_seconds"`
@@ -426,17 +697,21 @@ type AccountView struct {
 // viewOf 由账号构造只读快照（Views / View / 写接口响应复用同一份）。
 func viewOf(account *Account, now int64) AccountView {
 	view := AccountView{
-		ID:              account.ID,
-		Name:            account.Name,
-		UserID:          account.UserID,
-		Enabled:         account.Enabled,
-		Priority:        account.Priority,
-		TokenTail:       upstream.TokenTail(account.AccessToken),
-		ExpiresAt:       account.ExpiresAt,
-		CooldownUntil:   account.CooldownUntil,
-		LastRefreshAt:   account.LastRefreshAt,
-		LastError:       account.LastError,
-		HasRefreshToken: account.RefreshToken != "",
+		ID:               account.ID,
+		Name:             account.Name,
+		UserID:           account.UserID,
+		Enabled:          account.Enabled,
+		Priority:         account.Priority,
+		Weight:           int(effectiveWeight(account)),
+		LastUsedAt:       account.LastUsedAt,
+		ConsecutiveFails: account.ConsecutiveFails,
+		InFlight:         account.inFlight,
+		TokenTail:        upstream.TokenTail(account.AccessToken),
+		ExpiresAt:        account.ExpiresAt,
+		CooldownUntil:    account.CooldownUntil,
+		LastRefreshAt:    account.LastRefreshAt,
+		LastError:        account.LastError,
+		HasRefreshToken:  account.RefreshToken != "",
 	}
 	if account.ExpiresAt > 0 {
 		view.ExpiresInSeconds = (account.ExpiresAt - now) / 1000
@@ -482,14 +757,21 @@ func (p *Pool) Add(account *Account) error {
 	if account == nil {
 		return errors.New("账号为空")
 	}
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+
 	p.mu.Lock()
 	if p.findLocked(account.ID) != nil {
 		p.mu.Unlock()
 		return ErrAccountExists
 	}
-	p.accounts = append(p.accounts, account.clone())
+	dup := account.clone()
+	if dup.Weight <= 0 {
+		dup.Weight = 100
+	}
+	p.accounts = append(p.accounts, dup)
 	p.mu.Unlock()
-	return p.persist()
+	return p.persistLocked()
 }
 
 // Upsert 按 id 新增或更新账号（SPEC5 §K2 网页登录落账号）。
@@ -501,6 +783,9 @@ func (p *Pool) Upsert(account *Account) (bool, error) {
 	if account == nil {
 		return false, errors.New("账号为空")
 	}
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+
 	p.mu.Lock()
 	existing := p.findLocked(account.ID)
 	updated := existing != nil
@@ -519,16 +804,23 @@ func (p *Pool) Upsert(account *Account) (bool, error) {
 			existing.extra[key] = value
 		}
 	} else {
-		p.accounts = append(p.accounts, account.clone())
+		dup := account.clone()
+		if dup.Weight <= 0 {
+			dup.Weight = 100
+		}
+		p.accounts = append(p.accounts, dup)
 	}
 	p.mu.Unlock()
-	return updated, p.persist()
+	return updated, p.persistLocked()
 }
 
 // Update 只改给出的字段并原子回写；账号不存在返回 ErrAccountNotFound。
 //
 // 更新 access_token 时同步重算 expires_at 与 user_id（SPEC4 §G.2）。
 func (p *Pool) Update(id string, patch AccountPatch) error {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+
 	p.mu.Lock()
 	account := p.findLocked(id)
 	if account == nil {
@@ -553,11 +845,14 @@ func (p *Pool) Update(id string, patch AccountPatch) error {
 		account.UserID = upstream.JWTUserID(*patch.AccessToken)
 	}
 	p.mu.Unlock()
-	return p.persist()
+	return p.persistLocked()
 }
 
 // Remove 删除账号并原子回写；账号不存在返回 ErrAccountNotFound。
 func (p *Pool) Remove(id string) error {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+
 	p.mu.Lock()
 	index := -1
 	for i, account := range p.accounts {
@@ -571,8 +866,9 @@ func (p *Pool) Remove(id string) error {
 		return ErrAccountNotFound
 	}
 	p.accounts = append(p.accounts[:index], p.accounts[index+1:]...)
+	delete(p.rrWeight, id)
 	p.mu.Unlock()
-	return p.persist()
+	return p.persistLocked()
 }
 
 // TestToken 用账号当前 token 只读地打一次上游目录，返回状态码与模型条数。

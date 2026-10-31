@@ -2,11 +2,10 @@
 package server
 
 import (
-	"crypto/subtle"
 	"net/http"
-	"strings"
 	"time"
 
+	"xhx2api/internal/auth"
 	"xhx2api/internal/checkin"
 	"xhx2api/internal/config"
 	"xhx2api/internal/logx"
@@ -25,6 +24,10 @@ type Server struct {
 	checkin *checkin.Service
 	login   *loginManager
 
+	authManager  *auth.Manager
+	cookieSecure bool
+	loginLimiter *loginLimiter
+
 	startedAt time.Time
 	version   string
 }
@@ -32,20 +35,27 @@ type Server struct {
 // New 构造 Server。
 func New(cfg *config.Config, client *upstream.Client, accountPool *pool.Pool, catalog *Catalog, logger *logx.Logger, ver string) *Server {
 	return &Server{
-		cfg:       cfg,
-		client:    client,
-		pool:      accountPool,
-		catalog:   catalog,
-		logs:      NewLogBuffer(cfg.Log.BufferSizeValue()),
-		logger:    logger,
-		login:     newLoginManager(),
-		startedAt: time.Now(),
-		version:   ver,
+		cfg:          cfg,
+		client:       client,
+		pool:         accountPool,
+		catalog:      catalog,
+		logs:         NewLogBuffer(cfg.Log.BufferSizeValue()),
+		logger:       logger,
+		login:        newLoginManager(),
+		loginLimiter: newLoginLimiter(),
+		startedAt:    time.Now(),
+		version:      ver,
 	}
 }
 
 // SetCheckin 注入每日签到服务（供 /admin/api/checkin 使用）。
 func (s *Server) SetCheckin(svc *checkin.Service) { s.checkin = svc }
+
+// SetAuth 注入管理员认证管理器与 Cookie Secure 配置。
+func (s *Server) SetAuth(manager *auth.Manager, cookieSecure bool) {
+	s.authManager = manager
+	s.cookieSecure = cookieSecure
+}
 
 // Handler 返回带路由与中间件的 http.Handler。
 func (s *Server) Handler() http.Handler {
@@ -55,66 +65,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /favicon.ico", s.handleFavicon)
 	mux.Handle("GET /v1/models", s.v1Auth(http.HandlerFunc(s.handleModels)))
 	mux.Handle("POST /v1/chat/completions", s.v1Auth(http.HandlerFunc(s.handleChat)))
-	mux.Handle("GET /admin", s.adminAuth(http.HandlerFunc(s.handleAdminPage)))
-	mux.Handle("GET /admin/", s.adminAuth(http.HandlerFunc(s.handleAdminPage)))
-	mux.Handle("GET /admin/api/", s.adminAuth(http.HandlerFunc(s.handleAdminAPI)))
-	mux.Handle("POST /admin/api/", s.adminAuth(http.HandlerFunc(s.handleAdminAPI)))
-	mux.Handle("PATCH /admin/api/", s.adminAuth(http.HandlerFunc(s.handleAdminAPI)))
-	mux.Handle("DELETE /admin/api/", s.adminAuth(http.HandlerFunc(s.handleAdminAPI)))
-	return mux
-}
-
-// v1Auth 校验 /v1 的 Bearer 鉴权（api_key 为空则不校验）。
-func (s *Server) v1Auth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := s.cfg.APIKeyValue()
-		if key != "" {
-			provided := bearerToken(r)
-			if subtle.ConstantTimeCompare([]byte(provided), []byte(key)) != 1 {
-				writeError(w, http.StatusUnauthorized, apiError{
-					Message: "API key 无效",
-					Type:    typeAuthentication,
-					Code:    "invalid_api_key",
-				})
-				return
-			}
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-// adminAuth 校验管理面板鉴权（支持 Authorization 头与 ?key= 两种）。
-func (s *Server) adminAuth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.cfg.Admin.AdminEnabled() {
-			http.NotFound(w, r)
-			return
-		}
-		key := s.cfg.Admin.AdminAPIKey()
-		if key != "" {
-			provided := bearerToken(r)
-			if provided == "" {
-				provided = r.URL.Query().Get("key")
-			}
-			if subtle.ConstantTimeCompare([]byte(provided), []byte(key)) != 1 {
-				writeError(w, http.StatusUnauthorized, apiError{
-					Message: "管理密钥无效",
-					Type:    typeAuthentication,
-					Code:    "invalid_admin_key",
-				})
-				return
-			}
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-func bearerToken(r *http.Request) string {
-	auth := r.Header.Get("Authorization")
-	if strings.HasPrefix(auth, "Bearer ") {
-		return strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
-	}
-	return ""
+	mux.HandleFunc("GET /admin", s.handleAdminPage)
+	mux.HandleFunc("GET /admin/{$}", s.handleAdminPage)
+	mux.HandleFunc("/admin/api/auth/login", s.adminLogin)
+	mux.HandleFunc("/admin/api/auth/session", s.adminSession)
+	mux.Handle("/admin/api/auth/logout", s.adminAuth(http.HandlerFunc(s.adminLogout)))
+	mux.Handle("/admin/api/", s.adminAuth(http.HandlerFunc(s.handleAdminAPI)))
+	return s.securityHeaders(s.adminAvailability(mux))
 }
 
 // handleHealth 实现 GET /healthz（SPEC §6.1）。

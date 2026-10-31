@@ -23,35 +23,43 @@ import (
 
 // 默认值常量（集中在此，便于测试引用）。
 const (
-	DefaultListen                 = "0.0.0.0:3066"
-	DefaultLLMBase                = "https://xiaohuanxiong.com/api/web/llm/v2"
-	DefaultAuthBase               = "https://xiaohuanxiong.com/api/web/auth/v1"
-	DefaultPointsBase             = "https://xiaohuanxiong.com/api/web/points/v1"
-	DefaultOrigin                 = "https://xiaohuanxiong.com"
-	DefaultConnectTimeout         = 30
-	DefaultResponseHeaderTimeout  = 120
-	DefaultRequestTimeout         = 0
-	DefaultRefreshTimeout         = 30
-	DefaultCatalogTimeout         = 10
-	DefaultBalanceTimeout         = 20
-	DefaultBillsTimeout           = 25
-	DefaultUserAgent              = "xhx2api/0.1.0"
-	DefaultAccountsFile           = "./data/accounts.json"
-	DefaultStrategy               = "round_robin"
-	DefaultRefreshMarginSeconds   = 300
-	DefaultCooldownSeconds        = 600
-	DefaultMaxAttempts            = 3
-	DefaultRefreshOn401           = true
-	DefaultModel                  = "sn-glm-5-3-flash"
-	DefaultValidate               = "catalog"
-	DefaultCatalogCacheSeconds    = 600
-	DefaultCatalogCacheFile       = "./data/model_catalog.json"
-	DefaultLogLevel               = "info"
-	DefaultAccessLog              = true
-	DefaultBufferSize             = 500
-	DefaultAdminEnabled           = true
-	DefaultAdminTitle             = "小浣熊反代"
-	DefaultShutdownTimeoutSeconds = 10
+	DefaultListen                     = "0.0.0.0:3066"
+	DefaultLLMBase                    = "https://xiaohuanxiong.com/api/web/llm/v2"
+	DefaultAuthBase                   = "https://xiaohuanxiong.com/api/web/auth/v1"
+	DefaultPointsBase                 = "https://xiaohuanxiong.com/api/web/points/v1"
+	DefaultOrigin                     = "https://xiaohuanxiong.com"
+	DefaultConnectTimeout             = 30
+	DefaultResponseHeaderTimeout      = 120
+	DefaultRequestTimeout             = 0
+	DefaultRefreshTimeout             = 30
+	DefaultCatalogTimeout             = 10
+	DefaultBalanceTimeout             = 20
+	DefaultBillsTimeout               = 25
+	DefaultUserAgent                  = "xhx2api/0.1.0"
+	DefaultAccountsFile               = "./data/accounts.json"
+	DefaultStrategy                   = "round_robin"
+	DefaultRefreshMarginSeconds       = 300
+	DefaultCooldownSeconds            = 600
+	DefaultMaxInflightPerAccount      = 4
+	DefaultServerErrorCooldownSeconds = 30
+	DefaultServerErrorCooldown        = DefaultServerErrorCooldownSeconds
+	DefaultFailureDecaySeconds        = 600
+	DefaultCooldownMaxSeconds         = 3600
+	DefaultMaxAttempts                = 3
+	DefaultRefreshOn401               = true
+	DefaultModel                      = "sn-glm-5-3-flash"
+	DefaultValidate                   = "catalog"
+	DefaultCatalogCacheSeconds        = 600
+	DefaultCatalogCacheFile           = "./data/model_catalog.json"
+	DefaultLogLevel                   = "info"
+	DefaultAccessLog                  = true
+	DefaultBufferSize                 = 500
+	DefaultAdminEnabled               = true
+	DefaultAdminTitle                 = "小浣熊反代"
+	DefaultAdminAuthFile              = "./data/auth.json"
+	DefaultAdminSessionTTLSeconds     = 43200
+	DefaultAdminCookieSecure          = false
+	DefaultShutdownTimeoutSeconds     = 10
 
 	// §A 每日签到默认值。
 	DefaultCheckinEnabled              = true
@@ -63,6 +71,8 @@ const (
 	DefaultCheckinMaxAttemptsPerDay    = 5
 	DefaultCheckinHistoryFile          = "./data/checkin.json"
 	DefaultCheckinHistoryDays          = 30
+	DefaultCheckinConcurrency          = 2
+	DefaultCheckinJitterSeconds        = 60
 
 	// §J 网页登录默认值。
 	DefaultLoginEnabled         = true
@@ -104,12 +114,16 @@ type UpstreamConfig struct {
 
 // AccountsConfig 是账号池配置（SPEC §3.2 / §5）。
 type AccountsConfig struct {
-	File                 *string `json:"file"`
-	Strategy             *string `json:"strategy"`
-	RefreshMarginSeconds *int    `json:"refresh_margin_seconds"`
-	CooldownSeconds      *int    `json:"cooldown_seconds"`
-	MaxAttempts          *int    `json:"max_attempts"`
-	RefreshOn401         *bool   `json:"refresh_on_401"`
+	File                       *string `json:"file"`
+	Strategy                   *string `json:"strategy"`
+	RefreshMarginSeconds       *int    `json:"refresh_margin_seconds"`
+	CooldownSeconds            *int    `json:"cooldown_seconds"`
+	MaxInflightPerAccount      *int    `json:"max_inflight_per_account"`
+	ServerErrorCooldownSeconds *int    `json:"server_error_cooldown_seconds"`
+	FailureDecaySeconds        *int    `json:"failure_decay_seconds"`
+	CooldownMaxSeconds         *int    `json:"cooldown_max_seconds"`
+	MaxAttempts                *int    `json:"max_attempts"`
+	RefreshOn401               *bool   `json:"refresh_on_401"`
 }
 
 // ModelsConfig 是模型目录配置（SPEC §3.2 / §6.2）。
@@ -130,9 +144,12 @@ type LogConfig struct {
 
 // AdminConfig 是管理面板配置（SPEC §3.2 / §6.1）。
 type AdminConfig struct {
-	Enabled *bool   `json:"enabled"`
-	APIKey  *string `json:"api_key"`
-	Title   *string `json:"title"`
+	Enabled           *bool   `json:"enabled"`
+	APIKey            *string `json:"api_key"`
+	Title             *string `json:"title"`
+	AuthFile          *string `json:"auth_file"`
+	SessionTTLSeconds *int    `json:"session_ttl_seconds"`
+	SecureCookie      *bool   `json:"cookie_secure"`
 }
 
 // CheckinConfig 是每日签到配置（SPEC2 §A.2）。
@@ -146,6 +163,8 @@ type CheckinConfig struct {
 	MaxAttemptsPerDay    *int    `json:"max_attempts_per_day"`
 	HistoryFile          *string `json:"history_file"`
 	HistoryDays          *int    `json:"history_days"`
+	Concurrency          *int    `json:"concurrency"`
+	JitterSeconds        *int    `json:"jitter_seconds"`
 }
 
 // LoginConfig 是网页登录配置（SPEC5 §J）。
@@ -247,6 +266,10 @@ func (c *Config) applyDefaults() {
 	a.Strategy = strPtr(a.Strategy, DefaultStrategy)
 	a.RefreshMarginSeconds = intPtr(a.RefreshMarginSeconds, DefaultRefreshMarginSeconds)
 	a.CooldownSeconds = intPtr(a.CooldownSeconds, DefaultCooldownSeconds)
+	a.MaxInflightPerAccount = intPtr(a.MaxInflightPerAccount, DefaultMaxInflightPerAccount)
+	a.ServerErrorCooldownSeconds = intPtr(a.ServerErrorCooldownSeconds, DefaultServerErrorCooldownSeconds)
+	a.FailureDecaySeconds = intPtr(a.FailureDecaySeconds, DefaultFailureDecaySeconds)
+	a.CooldownMaxSeconds = intPtr(a.CooldownMaxSeconds, DefaultCooldownMaxSeconds)
 	a.MaxAttempts = intPtr(a.MaxAttempts, DefaultMaxAttempts)
 	a.RefreshOn401 = boolPtr(a.RefreshOn401, DefaultRefreshOn401)
 	m := &c.Models
@@ -263,6 +286,9 @@ func (c *Config) applyDefaults() {
 	ad.Enabled = boolPtr(ad.Enabled, DefaultAdminEnabled)
 	ad.APIKey = strPtr(ad.APIKey, "")
 	ad.Title = strPtr(ad.Title, DefaultAdminTitle)
+	ad.AuthFile = strPtr(ad.AuthFile, DefaultAdminAuthFile)
+	ad.SessionTTLSeconds = intPtr(ad.SessionTTLSeconds, DefaultAdminSessionTTLSeconds)
+	ad.SecureCookie = boolPtr(ad.SecureCookie, DefaultAdminCookieSecure)
 	ci := &c.Checkin
 	ci.Enabled = boolPtr(ci.Enabled, DefaultCheckinEnabled)
 	ci.Time = strPtr(ci.Time, DefaultCheckinTime)
@@ -273,6 +299,8 @@ func (c *Config) applyDefaults() {
 	ci.MaxAttemptsPerDay = intPtr(ci.MaxAttemptsPerDay, DefaultCheckinMaxAttemptsPerDay)
 	ci.HistoryFile = strPtr(ci.HistoryFile, DefaultCheckinHistoryFile)
 	ci.HistoryDays = intPtr(ci.HistoryDays, DefaultCheckinHistoryDays)
+	ci.Concurrency = intPtr(ci.Concurrency, DefaultCheckinConcurrency)
+	ci.JitterSeconds = intPtr(ci.JitterSeconds, DefaultCheckinJitterSeconds)
 	lg := &c.Login
 	lg.Enabled = boolPtr(lg.Enabled, DefaultLoginEnabled)
 	lg.AppName = strPtr(lg.AppName, DefaultLoginAppName)
@@ -344,11 +372,16 @@ func (c *Config) Validate() error {
 		{"upstream.bills_timeout_seconds", *c.Upstream.BillsTimeoutSeconds},
 		{"accounts.refresh_margin_seconds", *c.Accounts.RefreshMarginSeconds},
 		{"accounts.cooldown_seconds", *c.Accounts.CooldownSeconds},
+		{"accounts.server_error_cooldown_seconds", *c.Accounts.ServerErrorCooldownSeconds},
+		{"accounts.failure_decay_seconds", *c.Accounts.FailureDecaySeconds},
+		{"accounts.cooldown_max_seconds", *c.Accounts.CooldownMaxSeconds},
 		{"models.catalog_cache_seconds", *c.Models.CatalogCacheSeconds},
 		{"log.buffer_size", *c.Log.BufferSize},
 		{"checkin.retry_interval_minutes", *c.Checkin.RetryIntervalMinutes},
 		{"checkin.history_days", *c.Checkin.HistoryDays},
+		{"checkin.jitter_seconds", *c.Checkin.JitterSeconds},
 		{"login.state_ttl_seconds", *c.Login.StateTTLSeconds},
+		{"admin.session_ttl_seconds", *c.Admin.SessionTTLSeconds},
 		{"shutdown_timeout_seconds", *c.ShutdownTimeoutSeconds},
 	}
 	for _, s := range seconds {
@@ -359,11 +392,26 @@ func (c *Config) Validate() error {
 	if *c.Accounts.MaxAttempts < 1 {
 		return fmt.Errorf("accounts.max_attempts 必须 >= 1（当前 %d）", *c.Accounts.MaxAttempts)
 	}
+	if *c.Accounts.MaxInflightPerAccount < 0 {
+		return fmt.Errorf("accounts.max_inflight_per_account 不能为负（当前 %d）", *c.Accounts.MaxInflightPerAccount)
+	}
+	if *c.Accounts.CooldownMaxSeconds < 1 {
+		return fmt.Errorf("accounts.cooldown_max_seconds 必须 >= 1（当前 %d）", *c.Accounts.CooldownMaxSeconds)
+	}
 	if *c.Checkin.BillsLimit < 1 {
 		return fmt.Errorf("checkin.bills_limit 必须 >= 1（当前 %d）", *c.Checkin.BillsLimit)
 	}
 	if *c.Checkin.MaxAttemptsPerDay < 1 {
 		return fmt.Errorf("checkin.max_attempts_per_day 必须 >= 1（当前 %d）", *c.Checkin.MaxAttemptsPerDay)
+	}
+	if *c.Checkin.Concurrency < 1 {
+		return fmt.Errorf("checkin.concurrency 必须 >= 1（当前 %d）", *c.Checkin.Concurrency)
+	}
+	if strings.TrimSpace(*c.Admin.AuthFile) == "" {
+		return errors.New("admin.auth_file 不能为空")
+	}
+	if *c.Admin.SessionTTLSeconds < 1 {
+		return fmt.Errorf("admin.session_ttl_seconds 必须 >= 1（当前 %d）", *c.Admin.SessionTTLSeconds)
 	}
 	if strings.TrimSpace(*c.Models.Default) == "" {
 		return errors.New("models.default 不能为空")
@@ -585,6 +633,26 @@ func (a *AccountsConfig) Cooldown() time.Duration {
 	return time.Duration(derefInt(a.CooldownSeconds, DefaultCooldownSeconds)) * time.Second
 }
 
+// MaxInflightPerAccountValue 返回单账号允许的最大并发在途请求数。
+func (a *AccountsConfig) MaxInflightPerAccountValue() int {
+	return derefInt(a.MaxInflightPerAccount, DefaultMaxInflightPerAccount)
+}
+
+// ServerErrorCooldown 返回连续 5xx/网络失败时首次退避时长。
+func (a *AccountsConfig) ServerErrorCooldown() time.Duration {
+	return time.Duration(derefInt(a.ServerErrorCooldownSeconds, DefaultServerErrorCooldownSeconds)) * time.Second
+}
+
+// FailureDecay 返回连续失败计数的自然衰减窗口。
+func (a *AccountsConfig) FailureDecay() time.Duration {
+	return time.Duration(derefInt(a.FailureDecaySeconds, DefaultFailureDecaySeconds)) * time.Second
+}
+
+// CooldownMax 返回单次冷却的封顶时长。
+func (a *AccountsConfig) CooldownMax() time.Duration {
+	return time.Duration(derefInt(a.CooldownMaxSeconds, DefaultCooldownMaxSeconds)) * time.Second
+}
+
 // MaxAttemptsValue 返回单次请求最多尝试账号数。
 func (a *AccountsConfig) MaxAttemptsValue() int { return derefInt(a.MaxAttempts, DefaultMaxAttempts) }
 
@@ -629,6 +697,19 @@ func (a *AdminConfig) AdminAPIKey() string { return derefStr(a.APIKey, "") }
 
 // AdminTitle 返回面板标题。
 func (a *AdminConfig) AdminTitle() string { return derefStr(a.Title, DefaultAdminTitle) }
+
+// AuthFileValue 返回管理员认证存储文件路径。
+func (a *AdminConfig) AuthFileValue() string { return derefStr(a.AuthFile, DefaultAdminAuthFile) }
+
+// SessionTTL 返回管理员会话有效期。
+func (a *AdminConfig) SessionTTL() time.Duration {
+	return time.Duration(derefInt(a.SessionTTLSeconds, DefaultAdminSessionTTLSeconds)) * time.Second
+}
+
+// CookieSecure 返回是否强制管理员会话 Cookie 使用 Secure。
+func (a *AdminConfig) CookieSecure() bool {
+	return derefBool(a.SecureCookie, DefaultAdminCookieSecure)
+}
 
 // parseClock 解析 HH:MM（24 小时制），返回小时与分钟（SPEC2 §A.2）。
 func parseClock(s string) (int, int, error) {
@@ -690,6 +771,16 @@ func (c *CheckinConfig) HistoryFileValue() string {
 // HistoryDaysValue 返回历史保留天数。
 func (c *CheckinConfig) HistoryDaysValue() int {
 	return derefInt(c.HistoryDays, DefaultCheckinHistoryDays)
+}
+
+// ConcurrencyValue 返回签到工作池并发数。
+func (c *CheckinConfig) ConcurrencyValue() int {
+	return derefInt(c.Concurrency, DefaultCheckinConcurrency)
+}
+
+// Jitter 返回账号签到启动的确定性抖动上限。
+func (c *CheckinConfig) Jitter() time.Duration {
+	return time.Duration(derefInt(c.JitterSeconds, DefaultCheckinJitterSeconds)) * time.Second
 }
 
 // LoginEnabled 返回是否启用网页登录（SPEC5 §J）。

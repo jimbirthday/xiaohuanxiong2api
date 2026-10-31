@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"xhx2api/internal/logx"
@@ -32,6 +33,8 @@ type Config struct {
 	MaxAttemptsPerDay int
 	HistoryFile       string
 	HistoryDays       int
+	Concurrency       int
+	Jitter            time.Duration
 }
 
 // Accounts 是签到所需的账号池能力（便于测试替换）。
@@ -47,11 +50,15 @@ type Service struct {
 	pool   Accounts
 	logger *logx.Logger
 
-	clock   func() time.Time // 可注入时钟
-	spacing time.Duration    // 账号之间的串行间隔，默认 1s
+	clock       func() time.Time // 可注入时钟
+	spacing     time.Duration    // 账号之间的串行间隔，默认 1s
+	wakeSegment time.Duration    // 墙钟分段长度，测试可缩短
 
-	mu    sync.Mutex
-	state *State
+	mu     sync.Mutex
+	state  *State
+	saveMu sync.Mutex
+
+	running atomic.Bool
 
 	startOnce sync.Once
 	stopCh    chan struct{}
@@ -61,13 +68,14 @@ type Service struct {
 // New 构造签到服务并加载历史文件（文件不存在则从空状态开始）。
 func New(cfg Config, client *upstream.Client, accounts Accounts, logger *logx.Logger) *Service {
 	svc := &Service{
-		cfg:     cfg,
-		client:  client,
-		pool:    accounts,
-		logger:  logger,
-		clock:   time.Now,
-		spacing: time.Second,
-		state:   loadState(cfg.HistoryFile),
+		cfg:         cfg,
+		client:      client,
+		pool:        accounts,
+		logger:      logger,
+		clock:       time.Now,
+		spacing:     time.Second,
+		wakeSegment: scheduleWakeSegment,
+		state:       loadState(cfg.HistoryFile),
 	}
 	return svc
 }
@@ -102,6 +110,8 @@ func (s *Service) save() {
 	if s.cfg.HistoryFile == "" {
 		return
 	}
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
 	s.mu.Lock()
 	data, err := json.MarshalIndent(s.state, "", "  ")
 	s.mu.Unlock()
@@ -144,27 +154,94 @@ func (s *Service) save() {
 	}
 }
 
-// CheckAll 串行处理所有启用账号（间隔 spacing，默认 1 秒），每个账号当天最多成功一次。
+// CheckAll 处理所有启用账号；同一时刻只允许一批，重复触发直接跳过。
+//
+// 账号按确定性抖动与 launch spacing 错峰启动，网络请求由固定大小的 worker
+// 池并发执行。函数同步等待本批 worker 结束，便于调用方和测试观察结果。
 func (s *Service) CheckAll(ctx context.Context) {
-	views := s.pool.Views()
-	first := true
-	for _, view := range views {
-		if !view.Enabled {
-			continue
-		}
-		if !first {
-			if !s.wait(ctx, s.spacing) {
-				return
-			}
-		}
-		first = false
-		s.checkAccount(ctx, view)
+	s.checkAll(ctx)
+}
+
+func (s *Service) checkAll(ctx context.Context) bool {
+	if !s.running.CompareAndSwap(false, true) {
+		s.logger.Debugf("[Checkin] 已有签到批次在运行，跳过本次触发")
+		return false
 	}
+	defer s.running.Store(false)
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if s.stopCh != nil {
+		done := make(chan struct{})
+		defer close(done)
+		go func() {
+			select {
+			case <-s.stopCh:
+				cancel()
+			case <-done:
+			}
+		}()
+	}
+
+	views := s.pool.Views()
+	eligible := make([]pool.AccountView, 0, len(views))
+	for _, view := range views {
+		if view.Enabled {
+			eligible = append(eligible, view)
+		}
+	}
+	if len(eligible) == 0 {
+		return true
+	}
+
+	workers := s.cfg.Concurrency
+	if workers <= 0 {
+		workers = 2
+	}
+	if workers > len(eligible) {
+		workers = len(eligible)
+	}
+	day := s.clock().Format("2006-01-02")
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				index := int(next.Add(1)) - 1
+				if index >= len(eligible) {
+					return
+				}
+				view := eligible[index]
+				delay := time.Duration(index)*s.spacing + accountJitter(view.ID, day, s.cfg.Jitter)
+				if !s.wait(runCtx, delay) {
+					return
+				}
+				if runCtx.Err() != nil {
+					return
+				}
+				s.checkAccount(runCtx, view)
+			}
+		}()
+	}
+	wg.Wait()
+	if runCtx.Err() != nil {
+		return false
+	}
+	return true
 }
 
 // wait 等待 d，期间收到 ctx 取消或 Stop 则返回 false。
 func (s *Service) wait(ctx context.Context, d time.Duration) bool {
 	if d <= 0 {
+		if s.stopCh != nil {
+			select {
+			case <-s.stopCh:
+				return false
+			default:
+			}
+		}
 		return ctx.Err() == nil
 	}
 	timer := time.NewTimer(d)
@@ -395,19 +472,29 @@ func (s *Service) Stop() {
 
 func (s *Service) loop() {
 	defer s.wg.Done()
-	s.logger.Infof("[Checkin] 已启用：每日 %s 执行，on_start=%v verify_bills=%v", s.cfg.Time, s.cfg.OnStart, s.cfg.VerifyBills)
+	workers := s.cfg.Concurrency
+	if workers <= 0 {
+		workers = 2
+	}
+	s.logger.Infof("[Checkin] 已启用：每日 %s 执行，on_start=%v verify_bills=%v concurrency=%d jitter=%s",
+		s.cfg.Time, s.cfg.OnStart, s.cfg.VerifyBills, workers, s.cfg.Jitter)
 	if s.cfg.OnStart {
-		s.CheckAll(context.Background())
+		s.checkAll(context.Background())
 	}
 	for {
-		delay := s.nextDelay()
-		timer := time.NewTimer(delay)
-		select {
-		case <-s.stopCh:
-			timer.Stop()
+		now := s.clock()
+		next := s.nextEvent(now)
+		segment := nextWakeDelay(now, next, s.wakeSegment)
+		if !s.wait(context.Background(), segment) {
 			return
-		case <-timer.C:
-			s.CheckAll(context.Background())
+		}
+		if s.clock().Before(next) {
+			continue
+		}
+		if !s.checkAll(context.Background()) {
+			if !s.wait(context.Background(), time.Second) {
+				return
+			}
 		}
 	}
 }
@@ -415,10 +502,7 @@ func (s *Service) loop() {
 // nextDelay 返回距离下一次触发的时长（跨天会重新计算）。
 func (s *Service) nextDelay() time.Duration {
 	now := s.clock()
-	next := s.nextDaily(now)
-	if retry, ok := s.earliestRetry(now); ok && retry.Before(next) {
-		next = retry
-	}
+	next := s.nextEvent(now)
 	delay := next.Sub(now)
 	if delay < 0 {
 		delay = 0

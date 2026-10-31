@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"xhx2api/internal/upstream"
@@ -65,6 +66,38 @@ func TestChatLogInvalidJSON(t *testing.T) {
 		return lg.Status == 400 && strings.Contains(lg.Error, "不是合法 JSON")
 	}); !ok {
 		t.Fatalf("日志里应有 400 非法 JSON 记录，实际：%+v", env.s.logs.Last(10))
+	}
+}
+
+// TestChatRejectsNonObjectJSONWithoutInflightLeak 覆盖 null/数组请求体：
+// 必须在选号前返回 400 invalid_json，不能 panic、访问上游或泄漏在途计数。
+func TestChatRejectsNonObjectJSONWithoutInflightLeak(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	env := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		writeJSON(w, http.StatusOK, map[string]any{"choices": []any{}})
+	}, []map[string]any{{
+		"id": "a1", "access_token": "tok", "enabled": true, "priority": 1,
+	}}, nil)
+
+	for _, body := range []string{"null", "[]"} {
+		t.Run(body, func(t *testing.T) {
+			resp, data := env.postChat(t, body)
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("状态码 = %d, body=%s", resp.StatusCode, data)
+			}
+			var envelope errorEnvelope
+			if err := json.Unmarshal(data, &envelope); err != nil {
+				t.Fatalf("解析错误响应失败: %v, body=%s", err, data)
+			}
+			if envelope.Error.Code != "invalid_json" {
+				t.Fatalf("错误码 = %q, 期望 invalid_json, body=%s", envelope.Error.Code, data)
+			}
+			assertServerNoInflight(t, env)
+		})
+	}
+	if got := upstreamCalls.Load(); got != 0 {
+		t.Fatalf("非对象 JSON 不应访问上游，实际调用 %d 次", got)
 	}
 }
 

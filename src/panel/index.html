@@ -160,9 +160,59 @@
   }
   .add-form .check { flex-direction: row; align-items: center; gap: 8px; align-self: end; }
   .add-form .check input { width: auto; }
+  .import-form {
+    display: flex; flex-direction: column; gap: 10px; background: var(--panel);
+    border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 12px 14px; margin-bottom: 10px;
+  }
+  .import-form .field { display: flex; flex-direction: column; gap: 5px; }
+  .import-form label { color: var(--muted); font-size: 12px; }
+  .import-form input[type="file"] {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 7px 9px; font: inherit; width: 100%;
+  }
+  .import-form .options, .import-form .actions {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px;
+  }
+  .import-form .options label { display: inline-flex; align-items: center; gap: 6px; color: var(--text); }
+  .import-form .options input { width: auto; }
+  .import-file-list {
+    margin: 0; padding: 0; list-style: none; color: var(--muted); font-size: 12px;
+    display: flex; flex-wrap: wrap; gap: 5px 14px;
+  }
+  .import-file-list:empty { display: none; }
+  .import-file-list li { overflow-wrap: anywhere; }
+  .import-result {
+    border-top: 1px solid var(--border); padding-top: 10px; display: flex;
+    flex-direction: column; gap: 8px;
+  }
+  .import-title { font-weight: 600; }
+  .import-title.preview { color: var(--warn); }
+  .import-title.ok { color: var(--ok); }
+  .import-stats { display: flex; flex-wrap: wrap; gap: 8px 18px; font-variant-numeric: tabular-nums; }
+  .import-stat { display: inline-flex; gap: 5px; align-items: baseline; }
+  .import-stat .k { color: var(--muted); font-size: 12px; }
+  .import-errors { margin: 0; padding-left: 20px; color: var(--err); font-size: 12px; max-height: 220px; overflow: auto; }
+  .import-errors li { overflow-wrap: anywhere; }
+  .import-note { color: var(--muted); font-size: 12px; }
   .form-msg { font-size: 12px; }
   .form-msg.err { color: var(--err); }
   .form-msg.ok { color: var(--ok); }
+  .admin-login { min-height: 70vh; display: flex; align-items: center; justify-content: center; }
+  .admin-login .login-card {
+    width: min(420px, 100%); background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 24px; box-shadow: 0 18px 48px rgba(0, 0, 0, .28);
+  }
+  .admin-login h1 { font-size: 20px; margin: 0 0 6px; }
+  .admin-login .hint { color: var(--muted); font-size: 12px; margin: 0 0 18px; }
+  .admin-login .field { display: flex; flex-direction: column; gap: 5px; margin-bottom: 12px; }
+  .admin-login label { color: var(--muted); font-size: 12px; }
+  .admin-login input {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 10px; font: inherit; width: 100%;
+  }
+  .admin-login button { width: 100%; margin-top: 4px; padding: 8px 12px; }
+  .admin-login .form-msg { min-height: 18px; margin-top: 10px; }
   .test-result { font-size: 12px; color: var(--muted); }
   .test-result.ok { color: var(--ok); }
   .test-result.err { color: var(--err); }
@@ -181,6 +231,26 @@
 </style>
 </head>
 <body>
+<section id="admin-login" class="admin-login">
+  <div class="login-card">
+    <h1>管理面板登录</h1>
+    <p class="hint">请输入管理员用户名和密码。首次生成的凭据见认证文件同目录的 initial-credentials.txt。</p>
+    <form id="admin-login-form">
+      <div class="field">
+        <label for="admin-username">用户名</label>
+        <input id="admin-username" type="text" autocomplete="username" required>
+      </div>
+      <div class="field">
+        <label for="admin-password">密码</label>
+        <input id="admin-password" type="password" autocomplete="current-password" required>
+      </div>
+      <button id="admin-login-submit" class="btn primary" type="submit">登录</button>
+      <div id="admin-login-msg" class="form-msg" role="alert"></div>
+    </form>
+  </div>
+</section>
+
+<div id="app-content" hidden>
 <div id="banner" class="banner" hidden>接口不可用</div>
 
 <div class="topbar">
@@ -191,7 +261,9 @@
   <div class="stat"><span class="k">模型数</span><span class="v" id="models-count">—</span></div>
   <div class="stat"><span class="k">账号可用 / 总数</span><span class="v" id="accounts-count">—</span></div>
   <div class="spacer"></div>
+  <span class="updated" id="current-user"></span>
   <span class="updated" id="updated">尚未刷新</span>
+  <button id="logout" class="btn" type="button">退出登录</button>
 </div>
 
 <section>
@@ -199,6 +271,7 @@
   <div class="toolbar">
     <button id="toggle-login" class="btn" type="button" aria-expanded="false" aria-controls="login-box">网页登录</button>
     <button id="toggle-add" class="btn" type="button" aria-expanded="false" aria-controls="add-account-form">手动添加账号</button>
+    <button id="toggle-import" class="btn" type="button" aria-expanded="false" aria-controls="import-account-form">导入账号</button>
     <span id="accounts-msg" class="form-msg"></span>
   </div>
   <div id="login-box" class="login-box" hidden>
@@ -243,6 +316,23 @@
       <button id="cancel-add" class="btn" type="button">取消</button>
     </div>
     <div id="add-msg" class="form-msg wide"></div>
+  </form>
+  <form id="import-account-form" class="import-form" enctype="multipart/form-data" hidden>
+    <div class="field">
+      <label for="import-files">账号文件（可多选，JSON / ZIP）</label>
+      <input id="import-files" type="file" accept=".json,.zip" multiple>
+    </div>
+    <ul id="import-file-list" class="import-file-list" aria-live="polite"></ul>
+    <div class="options">
+      <label for="import-overwrite"><input id="import-overwrite" type="checkbox"> 覆盖同 ID 账号</label>
+      <label for="import-dry-run"><input id="import-dry-run" type="checkbox"> 仅预演（不写盘）</label>
+    </div>
+    <div class="actions">
+      <button id="submit-import" class="btn primary" type="submit">开始导入</button>
+      <button id="cancel-import" class="btn" type="button">取消</button>
+    </div>
+    <div id="import-msg" class="form-msg" role="status"></div>
+    <div id="import-result" class="import-result" hidden aria-live="polite"></div>
   </form>
   <div class="scroll">
     <table>
@@ -297,50 +387,120 @@
     </table>
   </div>
 </section>
+</div>
 
 <script>
 (function () {
   "use strict";
 
-  // 管理密钥可选：从 ?key= 读取后附加到每个 API 请求（与 /admin 的鉴权方式一致）。
+  // 管理密钥仅作为兼容入口保留在内存中；密码登录后使用 HttpOnly 会话 Cookie。
   var KEY = new URLSearchParams(window.location.search).get("key") || "";
+  var CSRF_TOKEN = "";
+  var AUTH_MODE = "";
+  var refreshTimer = null;
+  var authenticated = false;
+  // 认证代次：登录、登出或初次会话探测完成时递增；迟到的旧响应不得覆盖新状态。
+  var authEpoch = 0;
 
-  function api(path) {
-    if (!KEY) return path;
-    return path + (path.indexOf("?") >= 0 ? "&" : "?") + "key=" + encodeURIComponent(KEY);
+  function setLoginMessage(message, isError) {
+    var el = document.getElementById("admin-login-msg");
+    el.textContent = message || "";
+    el.className = "form-msg " + (isError ? "err" : "");
+  }
+
+  // 认证失效时停止轮询并切回登录区，避免继续请求受保护接口。
+  function showLogin(message, isError) {
+    authEpoch++;
+    authenticated = false;
+    CSRF_TOKEN = "";
+    AUTH_MODE = "";
+    if (refreshTimer !== null) {
+      clearInterval(refreshTimer);
+      refreshTimer = null;
+    }
+    document.getElementById("app-content").hidden = true;
+    document.getElementById("admin-login").hidden = false;
+    document.getElementById("admin-password").value = "";
+    setLoginMessage(message || "", isError !== false && !!message);
+  }
+
+  function showApp(session) {
+    authEpoch++;
+    authenticated = true;
+    CSRF_TOKEN = session.csrf_token || "";
+    AUTH_MODE = session.auth_mode || "session";
+    document.getElementById("admin-login").hidden = true;
+    document.getElementById("app-content").hidden = false;
+    document.getElementById("current-user").textContent =
+      (session.username || "admin") + (AUTH_MODE === "api_key" ? "（API Key）" : "");
+    setLoginMessage("", false);
+    startPolling();
+  }
+
+  function requestHeaders(method, path) {
+    var headers = { "Accept": "application/json" };
+    // 会话模式不得混入旧管理密钥，否则 API Key 身份会覆盖 Cookie 会话与 CSRF 语义。
+    if (KEY && (AUTH_MODE === "api_key" || path === "/admin/api/auth/session")) {
+      headers.Authorization = "Bearer " + KEY;
+    }
+    if (method !== "GET" && CSRF_TOKEN) headers["X-CSRF-Token"] = CSRF_TOKEN;
+    return headers;
+  }
+
+  // JSON 与 multipart 共用响应处理，确保登录失效时统一停止轮询并切回登录区。
+  function parseResponse(r, skipAuthHandling, requestEpoch) {
+    return r.text().then(function (text) {
+      var parsed = null;
+      if (text) {
+        try { parsed = JSON.parse(text); } catch (e) { parsed = null; }
+      }
+      if (!r.ok) {
+        var message = parsed && parsed.error && parsed.error.message
+          ? parsed.error.message
+          : "HTTP " + r.status;
+        var err = new Error(message);
+        err.status = r.status;
+        if (!skipAuthHandling && requestEpoch === authEpoch && (r.status === 401 || r.status === 403)) {
+          showLogin("登录已失效，请重新登录");
+        }
+        throw err;
+      }
+      return parsed;
+    });
+  }
+
+  function requestJSON(method, path, body, skipAuthHandling) {
+    var requestEpoch = authEpoch;
+    var opts = {
+      method: method,
+      credentials: "same-origin",
+      headers: requestHeaders(method, path)
+    };
+    if (body !== undefined) {
+      opts.headers["Content-Type"] = "application/json";
+      opts.body = JSON.stringify(body);
+    }
+    return fetch(path, opts).then(function (r) { return parseResponse(r, skipAuthHandling, requestEpoch); });
+  }
+
+  // FormData 交给浏览器设置 multipart boundary，禁止手动覆盖 Content-Type。
+  function requestFormData(path, formData) {
+    var requestEpoch = authEpoch;
+    var opts = {
+      method: "POST",
+      credentials: "same-origin",
+      headers: requestHeaders("POST", path),
+      body: formData
+    };
+    return fetch(path, opts).then(function (r) { return parseResponse(r, false, requestEpoch); });
   }
 
   function getJSON(path) {
-    return fetch(api(path), { headers: { "Accept": "application/json" } }).then(function (r) {
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      return r.json();
-    });
+    return requestJSON("GET", path, undefined, false);
   }
 
-  // 写请求：统一走 api(path) 自动带 ?key=，错误时抛出接口返回的中文 message。
   function writeJSON(method, path, body) {
-    var opts = {
-      method: method,
-      headers: { "Content-Type": "application/json" }
-    };
-    if (body !== undefined) opts.body = JSON.stringify(body);
-    return fetch(api(path), opts).then(function (r) {
-      return r.text().then(function (text) {
-        var parsed = null;
-        if (text) {
-          try { parsed = JSON.parse(text); } catch (e) { parsed = null; }
-        }
-        if (!r.ok) {
-          var message = parsed && parsed.error && parsed.error.message
-            ? parsed.error.message
-            : "HTTP " + r.status;
-          var err = new Error(message);
-          err.status = r.status;
-          throw err;
-        }
-        return parsed;
-      });
-    });
+    return requestJSON(method, path, body, false);
   }
 
   function text(v) {
@@ -562,11 +722,12 @@
     });
   }
 
-  // ── 2a. 折叠开关：两块互斥，默认都收起（SPEC6 §N1） ──
+  // ── 2a. 折叠开关：各块互斥，默认都收起（SPEC6 §N1） ──
   // 用 hidden 属性控制显隐（CSS 对 [hidden] 做了兜底），并同步 .active / aria-expanded。
   var PANELS = [
     { btn: "toggle-login", body: "login-box" },
-    { btn: "toggle-add", body: "add-account-form" }
+    { btn: "toggle-add", body: "add-account-form" },
+    { btn: "toggle-import", body: "import-account-form" }
   ];
 
   function panelOpen(bodyId) {
@@ -655,7 +816,153 @@
     });
   })();
 
-  // ── 2c. 网页登录 ──
+  // ── 2c. 批量导入 ──
+  (function wireImportForm() {
+    var form = document.getElementById("import-account-form");
+    var input = document.getElementById("import-files");
+    var fileList = document.getElementById("import-file-list");
+    var msg = document.getElementById("import-msg");
+    var result = document.getElementById("import-result");
+    var submit = document.getElementById("submit-import");
+
+    function setImportMessage(message, isError) {
+      msg.textContent = message || "";
+      msg.className = "form-msg " + (isError ? "err" : "ok");
+    }
+
+    function renderImportFiles(files) {
+      fileList.replaceChildren();
+      for (var i = 0; i < files.length; i++) {
+        var item = document.createElement("li");
+        var name = document.createElement("span");
+        name.textContent = files[i].name;
+        item.appendChild(name);
+        if (typeof files[i].size === "number") {
+          var size = document.createElement("span");
+          size.textContent = "（" + files[i].size + " 字节）";
+          item.appendChild(size);
+        }
+        fileList.appendChild(item);
+      }
+    }
+
+    function appendImportStat(wrap, key, value) {
+      var stat = document.createElement("span");
+      stat.className = "import-stat";
+      var label = document.createElement("span");
+      label.className = "k";
+      label.textContent = key;
+      var number = document.createElement("b");
+      number.textContent = String(value === undefined || value === null ? 0 : value);
+      stat.appendChild(label);
+      stat.appendChild(number);
+      wrap.appendChild(stat);
+    }
+
+    function showImportResult(res) {
+      res = res || {};
+      var errors = Array.isArray(res.errors) ? res.errors : [];
+      result.replaceChildren();
+
+      var title = document.createElement("div");
+      title.className = "import-title " + (res.dry_run ? "preview" : "ok");
+      title.textContent = res.dry_run ? "预演，未写盘" : "导入完成，已写入账号池";
+      result.appendChild(title);
+
+      var stats = document.createElement("div");
+      stats.className = "import-stats";
+      appendImportStat(stats, "total", res.total);
+      appendImportStat(stats, "added", res.added);
+      appendImportStat(stats, "updated", res.updated);
+      appendImportStat(stats, "skipped", res.skipped);
+      appendImportStat(stats, "invalid", res.invalid);
+      appendImportStat(stats, "errors", errors.length);
+      result.appendChild(stats);
+
+      if (errors.length) {
+        var errorTitle = document.createElement("div");
+        errorTitle.className = "import-note";
+        errorTitle.textContent = "错误与跳过详情：";
+        result.appendChild(errorTitle);
+        var list = document.createElement("ul");
+        list.className = "import-errors";
+        errors.forEach(function (message) {
+          var item = document.createElement("li");
+          item.textContent = String(message);
+          list.appendChild(item);
+        });
+        result.appendChild(list);
+      }
+      if (res.errors_truncated) {
+        var truncated = document.createElement("div");
+        truncated.className = "import-note";
+        truncated.textContent = "错误条目过多，仅显示前 100 条。";
+        result.appendChild(truncated);
+      }
+      result.hidden = false;
+    }
+
+    document.getElementById("toggle-import").addEventListener("click", function () {
+      if (panelOpen("import-account-form")) {
+        setPanel("import-account-form", false);
+      } else {
+        closeOtherPanels("import-account-form");
+        setPanel("import-account-form", true);
+        setImportMessage("", false);
+      }
+    });
+
+    document.getElementById("cancel-import").addEventListener("click", function () {
+      setPanel("import-account-form", false);
+      setImportMessage("", false);
+    });
+
+    input.addEventListener("change", function () {
+      renderImportFiles(input.files || []);
+      setImportMessage("", false);
+    });
+
+    form.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      if (submit.disabled) return;
+      var files = input.files || [];
+      if (!files.length) {
+        setImportMessage("请选择至少一个 JSON 或 ZIP 文件", true);
+        return;
+      }
+
+      var overwrite = document.getElementById("import-overwrite").checked;
+      var dryRun = document.getElementById("import-dry-run").checked;
+      var formData = new FormData();
+      // 每个文件都使用服务端约定的 files 字段，批量上传时不能互相覆盖。
+      for (var i = 0; i < files.length; i++) {
+        formData.append("files", files[i], files[i].name);
+      }
+      formData.append("overwrite", overwrite ? "true" : "false");
+      formData.append("dry_run", dryRun ? "true" : "false");
+
+      submit.disabled = true;
+      result.hidden = true;
+      setImportMessage("正在上传并解析…", false);
+      requestFormData("/admin/api/accounts/import", formData)
+        .then(function (res) {
+          showImportResult(res);
+          setImportMessage("", false);
+          if (!res || !res.dry_run) {
+            form.reset();
+            renderImportFiles([]);
+          }
+          // 导入结果先展示；账号/状态刷新失败不覆盖成功统计，鉴权失效仍由请求层处理。
+          return Promise.all([loadAccounts(), loadStatus()]).catch(function () {});
+        })
+        .catch(function (err) {
+          setImportMessage((err && err.message) || "导入失败", true);
+        })
+        .then(function () { submit.disabled = false; });
+    });
+  })();
+
+  // ── 2d. 网页登录 ──
   var loginEnabled = false;
 
   function fmtTtl(sec) {
@@ -873,6 +1180,7 @@
 
   // 每 5 秒自动刷新；任一接口失败时显示「接口不可用」，但不清空已有数据。
   function refreshAll() {
+    if (!authenticated) return Promise.resolve(false);
     var tasks = [loadStatus(), loadAccounts(), loadBalance(), loadCheckin(), loadModels(), loadRequests()];
     return Promise.all(tasks.map(function (p) {
       return p.then(function () { return true; }, function () { return false; });
@@ -883,8 +1191,67 @@
     });
   }
 
-  refreshAll();
-  setInterval(refreshAll, 5000);
+  function startPolling() {
+    if (refreshTimer !== null) clearInterval(refreshTimer);
+    refreshAll();
+    refreshTimer = setInterval(refreshAll, 5000);
+  }
+
+  document.getElementById("admin-login-form").addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    var submit = document.getElementById("admin-login-submit");
+    if (submit.disabled) return;
+    submit.disabled = true;
+    setLoginMessage("正在登录…", false);
+    var payload = {
+      username: document.getElementById("admin-username").value.trim(),
+      password: document.getElementById("admin-password").value
+    };
+    var loginEpoch = ++authEpoch;
+    requestJSON("POST", "/admin/api/auth/login", payload, true)
+      .then(function (session) {
+        if (loginEpoch !== authEpoch) return;
+        if (!session || session.authenticated !== true) throw new Error("登录响应无效");
+        document.getElementById("admin-password").value = "";
+        showApp(session);
+      })
+      .catch(function (err) {
+        if (loginEpoch === authEpoch) setLoginMessage(err.message || "登录失败", true);
+      })
+      .then(function () { submit.disabled = false; });
+  });
+
+  document.getElementById("logout").addEventListener("click", function () {
+    var logoutEpoch = ++authEpoch;
+    var request = AUTH_MODE === "session"
+      ? requestJSON("POST", "/admin/api/auth/logout", undefined, true)
+      : Promise.resolve(null);
+    request.catch(function () {}).then(function () {
+      if (logoutEpoch !== authEpoch) return;
+      if (KEY) {
+        KEY = "";
+        var url = new URL(window.location.href);
+        url.searchParams.delete("key");
+        window.history.replaceState(null, "", url.pathname + url.search + url.hash);
+      }
+      showLogin("已退出登录", false);
+    });
+  });
+
+  // 启动只探测会话；未登录时绝不请求 status、账号列表等受保护接口。
+  showLogin("", false);
+  var bootstrapEpoch = authEpoch;
+  requestJSON("GET", "/admin/api/auth/session", undefined, true)
+    .then(function (session) {
+      if (bootstrapEpoch !== authEpoch) return;
+      if (!session || session.authenticated !== true) throw new Error("未登录");
+      showApp(session);
+    })
+    .catch(function (err) {
+      if (bootstrapEpoch !== authEpoch) return;
+      var expected = err && err.status === 401;
+      showLogin(expected ? "" : "无法验证登录状态，请重新登录", !expected);
+    });
 })();
 </script>
 </body>

@@ -26,6 +26,8 @@ func sp(v string) *string { return &v }
 func ip(v int) *int       { return &v }
 func bp(v bool) *bool     { return &v }
 
+const testAPIKey = "test-api-key"
+
 func testJWT(exp int64) string {
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
 	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, exp)))
@@ -63,6 +65,7 @@ func newTestEnv(t *testing.T, handler http.HandlerFunc, accounts []map[string]an
 	t.Cleanup(upstreamServer.Close)
 
 	cfg := config.Default()
+	cfg.APIKey = sp(testAPIKey)
 	cfg.Upstream.LLMBase = sp(upstreamServer.URL)
 	cfg.Upstream.AuthBase = sp(upstreamServer.URL)
 	cfg.Upstream.PointsBase = sp(upstreamServer.URL)
@@ -83,12 +86,16 @@ func newTestEnv(t *testing.T, handler http.HandlerFunc, accounts []map[string]an
 	logger := logx.New(io.Discard, "", logx.LevelInfo)
 	client := buildClient(cfg)
 	accountPool := pool.New(pool.Config{
-		File:                 cfg.Accounts.AccountsFile(),
-		Strategy:             cfg.Accounts.StrategyValue(),
-		RefreshMarginSeconds: int(cfg.Accounts.RefreshMargin().Seconds()),
-		CooldownSeconds:      int(cfg.Accounts.Cooldown().Seconds()),
-		MaxAttempts:          cfg.Accounts.MaxAttemptsValue(),
-		RefreshOn401:         cfg.Accounts.RefreshOn401Value(),
+		File:                       cfg.Accounts.AccountsFile(),
+		Strategy:                   cfg.Accounts.StrategyValue(),
+		RefreshMarginSeconds:       int(cfg.Accounts.RefreshMargin().Seconds()),
+		CooldownSeconds:            int(cfg.Accounts.Cooldown().Seconds()),
+		MaxInflightPerAccount:      cfg.Accounts.MaxInflightPerAccountValue(),
+		ServerErrorCooldownSeconds: int(cfg.Accounts.ServerErrorCooldown().Seconds()),
+		FailureDecaySeconds:        int(cfg.Accounts.FailureDecay().Seconds()),
+		CooldownMaxSeconds:         int(cfg.Accounts.CooldownMax().Seconds()),
+		MaxAttempts:                cfg.Accounts.MaxAttemptsValue(),
+		RefreshOn401:               cfg.Accounts.RefreshOn401Value(),
 	}, client, logger)
 	catalog := NewCatalog(client, cfg.Models.CatalogCacheTTL(), cfg.Models.CatalogCacheFileValue())
 	app := New(cfg, client, accountPool, catalog, logger, "test")
@@ -99,7 +106,13 @@ func newTestEnv(t *testing.T, handler http.HandlerFunc, accounts []map[string]an
 
 func (e *testEnv) postChat(t *testing.T, body string) (*http.Response, []byte) {
 	t.Helper()
-	resp, err := http.Post(e.hs.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, e.hs.URL+"/v1/chat/completions", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("构造 chat 请求失败: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("请求 chat 失败: %v", err)
 	}
@@ -436,6 +449,7 @@ func TestStreamingRewrite(t *testing.T) {
 	if !logs[0].Stream {
 		t.Fatal("日志 stream 应为 true")
 	}
+	assertServerNoInflight(t, env)
 }
 
 // ── 用例 6：非流式改写与字段保留 ──
@@ -556,7 +570,12 @@ func TestModelsEndpointEmptyCatalog(t *testing.T) {
 		t.Fatalf("测试前置：目录应为空，实际 %d", env.s.catalog.Count())
 	}
 
-	resp, err := http.Get(env.hs.URL + "/v1/models")
+	req, err := http.NewRequest(http.MethodGet, env.hs.URL+"/v1/models", nil)
+	if err != nil {
+		t.Fatalf("构造 /v1/models 请求失败: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("请求 /v1/models 失败: %v", err)
 	}

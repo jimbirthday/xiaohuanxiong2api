@@ -63,6 +63,18 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	// 合法 JSON 的 null 会令 map 保持 nil；数组等非对象值也会在解码时报错。
+	// 后续需要写入 fields["model"]，因此这里必须显式拒绝非对象请求体。
+	if fields == nil {
+		entry.Status = http.StatusBadRequest
+		entry.Error = "请求体必须是 JSON 对象"
+		writeError(w, http.StatusBadRequest, apiError{
+			Message: "请求体必须是 JSON 对象",
+			Type:    typeInvalidRequest,
+			Code:    "invalid_json",
+		})
+		return
+	}
 
 	// 模型解析：缺省回填默认模型，其余原样透传给上游（SPEC4 §F.2.3）。
 	clientModel := ""
@@ -125,89 +137,122 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	maxAttempts := s.cfg.Accounts.MaxAttemptsValue()
 	tried := map[string]bool{}
+	triedOrder := make([]string, 0, maxAttempts)
 	lastStatus := 0
 	var lastErr apiError
 	attempted := false
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		account := s.pool.Pick(tried)
+		account := s.pool.Acquire(tried)
 		if account == nil {
 			break
 		}
 		attempted = true
 		tried[account.ID] = true
+		triedOrder = append(triedOrder, account.ID)
 		entry.Account = account.ID
 		s.logger.Debugf("[chat] 选到账号 %s（第 %d 次尝试，model=%s）", account.ID, attempt+1, upstreamModel)
 
-		token, err := s.pool.Token(ctx, account.ID, false)
-		if err != nil {
-			s.logger.Warnf("[chat] 账号 %s 刷新失败：%v", account.ID, err)
-			lastErr = apiError{Message: "账号 " + account.ID + " 刷新失败：" + err.Error(), Type: typeUpstream, Code: "token_refresh_failed"}
-			lastStatus = http.StatusBadGateway
-			continue
-		}
-		resp, err := s.sendChat(ctx, token, upstreamBody, stream)
-		if err != nil {
-			lastErr = apiError{Message: "转发上游失败：" + err.Error(), Type: typeUpstream, Code: "upstream_network"}
-			lastStatus = http.StatusBadGateway
-			continue
-		}
+		done := false
+		func() {
+			// 在途名额在本次尝试的所有分支（成功、失败、超时、断开）统一归还。
+			defer s.pool.Release(account)
 
-		// 401 → 强制刷新同账号并重试一次（不计入 max_attempts，SPEC §5.3）。
-		if resp.StatusCode == http.StatusUnauthorized && s.cfg.Accounts.RefreshOn401Value() {
-			_ = resp.Body.Close()
-			token, err = s.pool.Token(ctx, account.ID, true)
+			token, err := s.pool.Token(ctx, account.ID, false)
 			if err != nil {
-				s.pool.MarkError(account.ID, err.Error())
-				s.logger.Warnf("[chat] 账号 %s 强制刷新失败：%v", account.ID, err)
-				lastErr = apiError{Message: "账号 " + account.ID + " 强制刷新失败：" + err.Error(), Type: typeUpstream, Code: "token_refresh_failed"}
+				s.logger.Warnf("[chat] 账号 %s 刷新失败：%v", account.ID, err)
+				lastErr = apiError{Message: "账号 " + account.ID + " 刷新失败：" + err.Error(), Type: typeUpstream, Code: "token_refresh_failed"}
 				lastStatus = http.StatusBadGateway
-				continue
+				return
 			}
-			resp, err = s.sendChat(ctx, token, upstreamBody, stream)
+			resp, err := s.sendChat(ctx, token, upstreamBody, stream)
 			if err != nil {
+				if ctx.Err() == nil {
+					_ = s.pool.RecordFailure(account.ID)
+				}
 				lastErr = apiError{Message: "转发上游失败：" + err.Error(), Type: typeUpstream, Code: "upstream_network"}
 				lastStatus = http.StatusBadGateway
-				continue
+				return
 			}
-		}
 
-		switch {
-		case resp.StatusCode >= 200 && resp.StatusCode < 300:
-			if stream {
-				s.forwardStream(ctx, w, resp, &entry, resolvedClient)
-			} else {
-				s.forwardJSON(w, resp, &entry, resolvedClient)
+			// 首次 401 强制刷新同一账号并重试一次；这次重试不额外消耗外层轮次。
+			if resp.StatusCode == http.StatusUnauthorized && s.cfg.Accounts.RefreshOn401Value() {
+				_ = readErrorBody(resp)
+				token, err = s.pool.Token(ctx, account.ID, true)
+				if err != nil {
+					s.pool.MarkError(account.ID, err.Error())
+					s.logger.Warnf("[chat] 账号 %s 强制刷新失败：%v", account.ID, err)
+					lastErr = apiError{Message: "账号 " + account.ID + " 强制刷新失败：" + err.Error(), Type: typeUpstream, Code: "token_refresh_failed"}
+					lastStatus = http.StatusBadGateway
+					return
+				}
+				resp, err = s.sendChat(ctx, token, upstreamBody, stream)
+				if err != nil {
+					if ctx.Err() == nil {
+						_ = s.pool.RecordFailure(account.ID)
+					}
+					lastErr = apiError{Message: "转发上游失败：" + err.Error(), Type: typeUpstream, Code: "upstream_network"}
+					lastStatus = http.StatusBadGateway
+					return
+				}
 			}
+
+			switch {
+			case resp.StatusCode >= 200 && resp.StatusCode < 300:
+				if stream {
+					s.forwardStream(ctx, w, resp, &entry, resolvedClient)
+				} else {
+					s.forwardJSON(w, resp, &entry, resolvedClient)
+				}
+				s.pool.RecordSuccess(account.ID)
+				done = true
+				return
+			case resp.StatusCode == http.StatusUnauthorized:
+				errBody := readErrorBody(resp)
+				s.pool.MarkError(account.ID, "上游返回 401")
+				lastErr = buildUpstreamError(http.StatusUnauthorized, errBody)
+				lastStatus = http.StatusBadGateway
+				return
+			case resp.StatusCode == http.StatusTooManyRequests:
+				retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
+				cooldown := s.cfg.Accounts.Cooldown()
+				if retryAfter > cooldown {
+					cooldown = retryAfter
+				}
+				if maximum := s.cfg.Accounts.CooldownMax(); maximum > 0 && cooldown > maximum {
+					cooldown = maximum
+				}
+				errBody := readErrorBody(resp)
+				s.pool.CooldownFor(account.ID, cooldown)
+				s.logger.Warnf("[chat] 账号 %s 收到 429，进入冷却 %s", account.ID, cooldown)
+				lastErr = buildUpstreamError(http.StatusTooManyRequests, errBody)
+				lastStatus = http.StatusTooManyRequests
+				return
+			case resp.StatusCode >= 500:
+				errBody := readErrorBody(resp)
+				_ = s.pool.RecordFailure(account.ID)
+				lastErr = buildUpstreamError(resp.StatusCode, errBody)
+				lastStatus = http.StatusBadGateway
+				return
+			default:
+				// 其它 4xx：不换号、不冷却，原状态码与上游 message 直接透传。
+				errBody := readErrorBody(resp)
+				upErr := buildUpstreamError(resp.StatusCode, errBody)
+				entry.Status = resp.StatusCode
+				entry.Error = upErr.Message
+				entry.UpstreamStatus = upErr.UpstreamStatus
+				entry.UpstreamCode = upErr.UpstreamCode
+				writeError(w, resp.StatusCode, upErr)
+				done = true
+				return
+			}
+		}()
+		if done {
 			return
-		case resp.StatusCode == http.StatusUnauthorized:
-			errBody := readErrorBody(resp)
-			s.pool.MarkError(account.ID, "上游返回 401")
-			lastErr = buildUpstreamError(http.StatusUnauthorized, errBody)
-			lastStatus = http.StatusBadGateway
-			continue
-		case resp.StatusCode == http.StatusTooManyRequests:
-			_ = resp.Body.Close()
-			s.pool.Cooldown(account.ID)
-			s.logger.Warnf("[chat] 账号 %s 收到 429，进入冷却 %s", account.ID, s.cfg.Accounts.Cooldown())
-			lastErr = buildUpstreamError(http.StatusTooManyRequests, nil)
-			lastStatus = http.StatusTooManyRequests
-			continue
-		case resp.StatusCode >= 500:
-			errBody := readErrorBody(resp)
-			lastErr = buildUpstreamError(resp.StatusCode, errBody)
-			lastStatus = http.StatusBadGateway
-			continue
-		default:
-			// 其它 4xx：不换号，原样透传状态码与上游 message（SPEC §5.4）。
-			errBody := readErrorBody(resp)
-			upErr := buildUpstreamError(resp.StatusCode, errBody)
-			entry.Status = resp.StatusCode
-			entry.Error = upErr.Message
-			entry.UpstreamStatus = upErr.UpstreamStatus
-			entry.UpstreamCode = upErr.UpstreamCode
-			writeError(w, resp.StatusCode, upErr)
-			return
+		}
+		// 客户端断开或请求级超时后不再继续换号；Release 已由闭包完成。
+		if ctx.Err() != nil {
+			break
 		}
 	}
 
@@ -223,7 +268,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if lastStatus == http.StatusTooManyRequests {
-		w.Header().Set("Retry-After", strconv.Itoa(int(s.cfg.Accounts.Cooldown().Seconds())))
+		remaining := s.pool.MinCooldownRemaining(triedOrder)
+		seconds := int((remaining + time.Second - 1) / time.Second)
+		if seconds < 0 {
+			seconds = 0
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
 		entry.Status = http.StatusTooManyRequests
 		entry.Error = lastErr.Message
 		entry.UpstreamStatus = lastErr.UpstreamStatus
@@ -239,6 +289,29 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	entry.UpstreamStatus = lastErr.UpstreamStatus
 	entry.UpstreamCode = lastErr.UpstreamCode
 	writeError(w, http.StatusBadGateway, lastErr)
+}
+
+// parseRetryAfter 解析 Retry-After 的整数秒或 HTTP 日期格式；非法值按 0 处理。
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	when, err := http.ParseTime(value)
+	if err != nil {
+		return 0
+	}
+	remaining := when.Sub(now)
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
 }
 
 // sendChat 转发一次聊天请求。

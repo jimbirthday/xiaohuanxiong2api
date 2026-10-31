@@ -25,6 +25,8 @@ func (s *Server) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		s.adminStatus(w, r)
 	case "/admin/api/accounts":
 		s.adminAccounts(w, r)
+	case "/admin/api/accounts/import":
+		s.adminImportAccounts(w, r)
 	case "/admin/api/accounts/balance":
 		s.adminBalance(w, r)
 	case "/admin/api/models":
@@ -132,21 +134,8 @@ func (s *Server) adminModels(w http.ResponseWriter, _ *http.Request) {
 
 // ── §G.2 账号写操作 ──
 
-// adminKeyMissingMessage 是未设置 admin.api_key 时写操作返回的中文原因。
-const adminKeyMissingMessage = "请先在 config.json 里设置 admin.api_key，再使用账号管理功能"
-
-// requireAdminWrite 校验写操作前提：admin.api_key 必须已设置。
-func (s *Server) requireAdminWrite(w http.ResponseWriter) bool {
-	if s.cfg.Admin.AdminAPIKey() == "" {
-		writeError(w, http.StatusForbidden, apiError{
-			Message: adminKeyMissingMessage,
-			Type:    typeAuthentication,
-			Code:    "admin_key_required",
-		})
-		return false
-	}
-	return true
-}
+// requireAdminWrite 保留既有调用点；写请求是否已认证统一由 adminAuth 中间件负责。
+func (s *Server) requireAdminWrite(_ http.ResponseWriter) bool { return true }
 
 func methodNotAllowed(w http.ResponseWriter) {
 	writeError(w, http.StatusMethodNotAllowed, apiError{
